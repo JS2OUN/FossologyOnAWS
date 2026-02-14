@@ -203,8 +203,7 @@ aws s3api head-object \
 # スタック作成
 aws cloudformation create-stack \
   --stack-name Fossology \
-  --template-body file://fossology-ecs-stack.yaml \
-  --parameters file://parameters.json \
+  --template-body file://fossology-ecs-stack.yaml \  
   --capabilities CAPABILITY_NAMED_IAM \
   --region ap-northeast-1 \
   --tags Key=Environment,Value=Production Key=Application,Value=Fossology
