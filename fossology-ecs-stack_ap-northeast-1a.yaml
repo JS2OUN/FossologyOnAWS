@@ -1,0 +1,720 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Fossology on ECS Fargate with Aurora Serverless v2, EFS, and mTLS-enabled ALB 1-zone(1a)'
+
+Parameters:
+
+  # Certification settings
+  CertificateArn:
+    Type: String
+    Description: 'ACM Certificate ARN'
+    Default: '[ACMサーバ証明書のARN](例:arn:aws:acm:ap-northeast-1:[アカウントID]:certificate/[証明書ID])'
+  
+  MTLSCertificateBucket:
+    Type: String
+    Description: 'S3 Bucket name containing mTLS root CA certificate'
+    Default: '[mTLSルートCA証明書のバケット名](例:fossology-rootca)'
+  
+  MTLSCertificateKey:
+    Type: String
+    Description: 'S3 Object key (path) for mTLS root CA certificate'
+    Default: '[ルートCA証明書(PEM形式)へのパス(バケット名は含まないこと)](例:rootCA.pem)'
+
+  # ECS settings
+  FossologyImage:
+    Type: String
+    Description: Docker image for Fossology
+    Default: '[FossologyのDockerイメージタグ](例:fossology/fossology:4.6.0)'
+
+  # Database settings
+  DBMasterUsername:
+    Type: String
+    Description: 'Master username for Aurora database'
+    Default: '[DBユーザ名](例:fossology)'
+    NoEcho: false
+  
+  DBMasterPassword:
+    Type: String
+    Description: 'Master password for Aurora database (min 8 characters)'
+    NoEcho: true
+    MinLength: 8
+    Default: '[DBのマスターパスワード(最小8文字)](例:ChangeMe12345!)'
+
+  AuroraEngineVersion:
+    Type: String
+    Description: Aurora PostgreSQL engine version
+    Default: '[Postgres SQLのDBエンジンバージョン](例:15.12)'
+
+  # Route53 settings
+  Route53HostedZoneId:
+    Type: String
+    Description: Hosted Zone ID for Route53 Record
+    Default: '[Route53のホストゾーンID]'
+
+  Route53RecordName:
+    Type: String
+    Description: Fully qualified domain name (FQDN) for the record (e.g. example.com)
+    Default: '[FossologyサーバのFQDN](例:fossology.example.com)'
+
+  # VPC settings(そのままでよいが、VPCピアリングを行うなど、必要があれば書き換える)
+  VpcCIDR:
+    Type: String
+    Description: 'CIDR block for VPC'
+    Default: '172.32.0.0/16'
+  
+  PublicSubnet1CIDR:
+    Type: String
+    Description: 'CIDR block for Public Subnet 1'
+    Default: '172.32.1.0/24'
+  
+  PublicSubnet2CIDR:
+    Type: String
+    Description: 'CIDR block for Public Subnet 2'
+    Default: '172.32.2.0/24'
+  
+  PrivateSubnet1CIDR:
+    Type: String
+    Description: 'CIDR block for Private Subnet 1'
+    Default: '172.32.11.0/24'
+  
+  PrivateSubnet2CIDR:
+    Type: String
+    Description: 'CIDR block for Private Subnet 2'
+    Default: '172.32.12.0/24'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcCIDR
+          - PublicSubnet1CIDR
+          - PublicSubnet2CIDR
+          - PrivateSubnet1CIDR
+          - PrivateSubnet2CIDR
+      - Label:
+          default: 'SSL/TLS Configuration'
+        Parameters:
+          - CertificateArn
+          - MTLSCertificateBucket
+          - MTLSCertificateKey
+      - Label:
+          default: 'Database Configuration'
+        Parameters:
+          - DBMasterUsername
+          - DBMasterPassword
+
+Resources:
+  # ==================== VPC and Networking ====================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-1a'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}c'
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-1c'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-1a'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}c'
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-1c'
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip-1a'
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-1a'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-1a'
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-1c'
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # ==================== Security Groups ====================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-alb-sg'
+      GroupDescription: 'Security group for Fossology ALB'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS from Internet'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-ecs-sg'
+      GroupDescription: 'Security group for Fossology ECS tasks'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'HTTP from ALB'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ecs-sg'
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-efs-sg'
+      GroupDescription: 'Security group for Fossology EFS'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+          Description: 'NFS from ECS'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-efs-sg'
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-rds-sg'
+      GroupDescription: 'Security group for Fossology Aurora'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+          Description: 'PostgreSQL from ECS'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rds-sg'
+
+  # ==================== EFS ====================
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_7_DAYS
+        - TransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-fossology-efs'
+
+  EFSMountTargetAZ1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # ==================== Aurora Serverless v2 ====================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${AWS::StackName}-db-subnet-group'
+      DBSubnetGroupDescription: 'Subnet group for Fossology Aurora'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-subnet-group'
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub '${AWS::StackName}-aurora-cluster'
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EngineVersion: !Ref AuroraEngineVersion
+      DatabaseName: fossology
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RDSSecurityGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.0
+        MaxCapacity: 1.0
+      BackupRetentionPeriod: 1
+      PreferredBackupWindow: '17:00-18:00'
+      PreferredMaintenanceWindow: 'sun:18:00-sun:19:00'
+      StorageEncrypted: true      
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-cluster'
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-aurora-instance'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-instance'
+
+  # ==================== ECS Cluster ====================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cluster'
+
+  # ==================== CloudWatch Logs ====================
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-fossology'
+      RetentionInDays: 7
+
+  # ==================== IAM Roles ====================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecs-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref DBPasswordSecret
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EFSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'elasticfilesystem:ClientMount'
+                  - 'elasticfilesystem:ClientWrite'
+                  - 'elasticfilesystem:DescribeMountTargets'
+                Resource: !GetAtt EFSFileSystem.Arn
+
+  # ==================== Secrets Manager ====================
+  DBPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/db/password'
+      Description: 'Database password for Fossology'
+      SecretString: !Sub |
+        {
+          "username": "${DBMasterUsername}",
+          "password": "${DBMasterPassword}",
+          "host": "${AuroraCluster.Endpoint.Address}",
+          "port": 5432,
+          "dbname": "fossology"
+        }
+
+  # ==================== ECS Task Definition ====================
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EFSMountTargetAZ1
+    Properties:
+      Family: !Sub '${AWS::StackName}-fossology'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '2048'
+      Memory: '4096'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      Volumes:
+        - Name: fossology-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: fossology
+          Image: !Ref FossologyImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Command:
+            - /bin/bash
+            - -c
+            - |
+              echo "Checking if Fossology DB schema exists...";
+              if PGPASSWORD="$FOSSOLOGY_DB_PASSWORD" psql \
+                -h "$FOSSOLOGY_DB_HOST" \
+                -U "$FOSSOLOGY_DB_USER" \
+                -d "$FOSSOLOGY_DB_NAME" \
+                -tAc "SELECT 1 FROM information_schema.tables WHERE table_name='license_ref'" \
+                | grep -q 1; then
+                  echo "Schema detected. Skipping DB initialization.";
+                  exec /usr/sbin/apache2ctl -D FOREGROUND;
+              else
+                  echo "Schema not found. Running default entrypoint (init).";
+                  # Change the entrypoint path if necessary in different container images
+                  exec /fossology/docker-entrypoint.sh;
+              fi
+          Environment:
+            - Name: FOSSOLOGY_DB_HOST
+              Value: !GetAtt AuroraCluster.Endpoint.Address
+            - Name: FOSSOLOGY_DB_NAME
+              Value: fossology
+            - Name: FOSSOLOGY_DB_USER
+              Value: !Ref DBMasterUsername
+          Secrets:
+            - Name: FOSSOLOGY_DB_PASSWORD
+              ValueFrom: !Sub '${DBPasswordSecret}:password::'
+          MountPoints:
+            - SourceVolume: fossology-data
+              ContainerPath: /srv/fossology/repository
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: fossology
+
+  # ==================== Application Load Balancer ====================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200-399'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tg'
+
+  # Trust Store for mTLS (must be created manually or via separate process)
+  # Note: TrustStore requires the CA bundle to be uploaded to S3 first
+  MTLSTrustStore:
+    Type: AWS::ElasticLoadBalancingV2::TrustStore
+    Properties:
+      Name: !Sub '${AWS::StackName}-mtls-trust-store'
+      CaCertificatesBundleS3Bucket: !Ref MTLSCertificateBucket
+      CaCertificatesBundleS3Key: !Ref MTLSCertificateKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-mtls-trust-store'
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      MutualAuthentication:
+        Mode: verify
+        TrustStoreArn: !Ref MTLSTrustStore
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ==================== ECS Service ====================
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HTTPSListener
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: fossology
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-service'
+
+  # ==================== Route 53 ====================
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZoneId
+      Name: !Ref Route53RecordName
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        EvaluateTargetHealth: true
+
+Outputs:
+  VpcId:
+    Description: 'VPC ID'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PublicSubnets:
+    Description: 'Public Subnets'
+    Value: !Sub '${PublicSubnet1}, ${PublicSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-Public-Subnets'
+
+  PrivateSubnets:
+    Description: 'Private Subnets'
+    Value: !Sub '${PrivateSubnet1}, ${PrivateSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-Private-Subnets'
+
+  LoadBalancerDNS:
+    Description: 'DNS name of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-DNS'
+
+  FossologyURL:
+    Description: 'Fossology application URL'
+    Value: !Sub 'https://${Route53RecordName}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-URL'
+
+  EFSFileSystemId:
+    Description: 'EFS File System ID'
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-ID'
+
+  AuroraClusterEndpoint:
+    Description: 'Aurora Cluster Endpoint'
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DB-Endpoint'
+
+  ECSClusterName:
+    Description: 'ECS Cluster Name'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-Cluster'
+
+  DBSecretArn:
+    Description: 'Secrets Manager ARN for database credentials'
+    Value: !Ref DBPasswordSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-DB-Secret'
