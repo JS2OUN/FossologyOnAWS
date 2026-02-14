@@ -1,9 +1,11 @@
-# Fossology on AWS ECS - デプロイマニュアル
+# Fossology on AWS Serverless - デプロイマニュアル
 
 ## 📋 目次
 
-- [Fossology on AWS ECS - デプロイマニュアル](#fossology-on-aws-ecs---デプロイマニュアル)
+- [Fossology on AWS Serverless - デプロイマニュアル](#fossology-on-aws-serverless---デプロイマニュアル)
   - [📋 目次](#-目次)
+  - [はじめに](#はじめに)
+    - [システム構成概要](#システム構成概要)
   - [前提条件](#前提条件)
     - [必要なツール](#必要なツール)
     - [AWSリソース](#awsリソース)
@@ -22,6 +24,28 @@
     - [ステップ1: スタックの作成](#ステップ1-スタックの作成)
 
 ---
+
+## はじめに
+
+- このCloudformationスタックは、Fossologyの機能実現のため、以下のサーバレスなサービスにより構成されています。
+
+### システム構成概要
+
+```text
+インターネット ←→ Internet Gateway
+                     ↓
+                  ALB (Public Subnet) ※mTLSによる相互TLS
+                     ↓
+             ECS Fargate (Private Subnet)
+                 ↓   ↓   ↓
+            Aurora  EFS  外部API
+        (serverless)     ↓
+                    NAT Gateway
+                         ↓
+                   Internet Gateway
+                         ↓
+                  外部サービス (GitHub等)
+```
 
 ## 前提条件
 
@@ -87,6 +111,7 @@ openssl x509 -in rootCA.pem -text -noout
 openssl genrsa -out client.key 2048
 
 # 2. クライアント証明書署名要求 (CSR) の作成
+# -subjのパラメータは適宜変更のこと
 openssl req -new \
   -key client.key \
   -out client.csr \
@@ -105,7 +130,7 @@ openssl x509 -req \
   -CAcreateserial \
   -out client.crt \
   -days 730 \
-  -sha256
+  -sha256 \
   -extfile client_ext.cnf
 
 # 5. クライアント証明書の確認
