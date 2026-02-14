@@ -19,9 +19,7 @@
     - [ステップ2: ルートCA証明書のアップロード](#ステップ2-ルートca証明書のアップロード)
     - [ステップ3: S3オブジェクトの権限確認](#ステップ3-s3オブジェクトの権限確認)
   - [CloudFormationスタックのデプロイ](#cloudformationスタックのデプロイ)
-    - [ステップ4: スタックの作成](#ステップ4-スタックの作成)
-    - [ステップ5: デプロイ進捗の監視](#ステップ5-デプロイ進捗の監視)
-    - [ステップ6: デプロイ完了の確認](#ステップ6-デプロイ完了の確認)
+    - [ステップ1: スタックの作成](#ステップ1-スタックの作成)
 
 ---
 
@@ -197,7 +195,7 @@ aws s3api head-object \
 
 ## CloudFormationスタックのデプロイ
 
-### ステップ4: スタックの作成
+### ステップ1: スタックの作成
 
 ```bash
 # スタック作成
@@ -207,56 +205,4 @@ aws cloudformation create-stack \
   --capabilities CAPABILITY_NAMED_IAM \
   --region ap-northeast-1 \
   --tags Key=Environment,Value=Production Key=Application,Value=Fossology
-
-# スタックIDを取得
-STACK_ID=$(aws cloudformation describe-stacks \
-  --stack-name Fossology \
-  --region ap-northeast-1 \
-  --query 'Stacks[0].StackId' \
-  --output text)
-
-echo "Stack ID: $STACK_ID"
-```
-
-### ステップ5: デプロイ進捗の監視
-
-```bash
-# リアルタイムでイベントを監視
-watch -n 10 'aws cloudformation describe-stack-events \
-  --stack-name Fossology \
-  --region ap-northeast-1 \
-  --max-items 10 \
-  --query "StackEvents[*].[Timestamp,ResourceStatus,ResourceType,LogicalResourceId]" \
-  --output table'
-
-# または、スタックステータスのみ確認
-aws cloudformation describe-stacks \
-  --stack-name Fossology \
-  --region ap-northeast-1 \
-  --query 'Stacks[0].StackStatus' \
-  --output text
-```
-
-**ステータスの意味**:
-- `CREATE_IN_PROGRESS`: デプロイ中
-- `CREATE_COMPLETE`: デプロイ成功 ✅
-- `CREATE_FAILED`: デプロイ失敗 ❌
-- `ROLLBACK_IN_PROGRESS`: ロールバック中
-
-### ステップ6: デプロイ完了の確認
-
-```bash
-# スタック出力の取得
-aws cloudformation describe-stacks \
-  --stack-name Fossology \
-  --region ap-northeast-1 \
-  --query 'Stacks[0].Outputs' \
-  --output table
-
-# JSONフォーマットで保存
-aws cloudformation describe-stacks \
-  --stack-name Fossology \
-  --region ap-northeast-1 \
-  --query 'Stacks[0].Outputs' \
-  --output json > stack-outputs.json
 ```
